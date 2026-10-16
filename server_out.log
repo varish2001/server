@@ -1,6 +1,0 @@
-
-> ai-virtual-gym-trainer-server@1.0.0 start
-> node src/server.js
-
-MongoDB connected
-Server running on port 5000
