@@ -14,6 +14,10 @@ const signToken = (userId) =>
   });
 
 export const getStarted = async (req, res) => {
+  if (!req.body || typeof req.body !== "object" || Array.isArray(req.body)) {
+    return res.status(400).json({ message: "Invalid profile data", errors: { body: "A JSON object is required" } });
+  }
+
   try {
     const {
       age,
@@ -43,7 +47,19 @@ export const getStarted = async (req, res) => {
       equipmentPreference,
       injuriesLimitations
     };
-    const user = runtimeState.dbConnected ? await User.create(payload) : memoryStore.createUser(payload);
+    const profile = new User(payload);
+    const validationError = profile.validateSync();
+    if (validationError) {
+      const errors = Object.fromEntries(
+        Object.keys(validationError.errors).map((field) => [field, "Invalid or missing value"])
+      );
+      return res.status(400).json({ message: "Invalid profile data", errors });
+    }
+
+    const { _id, createdAt, updatedAt, ...validatedPayload } = profile.toObject({ versionKey: false });
+    const user = runtimeState.dbConnected
+      ? await User.create(validatedPayload)
+      : memoryStore.createUser(validatedPayload);
 
     const { workout, diet, source } = await generatePersonalizedPlans(user);
     const workoutPlan = {
@@ -74,7 +90,11 @@ export const getStarted = async (req, res) => {
       recommendationSource: source
     });
   } catch (error) {
-    res.status(500).json({ message: error.message });
+    console.error("Profile creation failed", {
+      name: error.name,
+      code: typeof error.code === "string" || typeof error.code === "number" ? error.code : undefined
+    });
+    res.status(500).json({ message: "Unable to create profile" });
   }
 };
 

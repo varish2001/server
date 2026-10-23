@@ -1,3 +1,4 @@
+import "dotenv/config";
 import cors from "cors";
 import express from "express";
 import userRoutes from "./routes/userRoutes.js";
@@ -9,28 +10,55 @@ import { protect } from "./middleware/auth.js";
 
 export const app = express();
 
+const normalizeOrigin = (value) => {
+  if (typeof value !== "string" || !value.trim()) return null;
+
+  try {
+    const url = new URL(value.trim());
+    if (
+      !["http:", "https:"].includes(url.protocol) ||
+      url.username ||
+      url.password ||
+      url.pathname !== "/" ||
+      url.search ||
+      url.hash
+    ) {
+      return null;
+    }
+    return url.origin;
+  } catch {
+    return null;
+  }
+};
+
 const allowedOrigins = new Set(
   [
-    process.env.CLIENT_URL,
-    process.env.CLIENT_URLS?.split(","),
-    "https://client0-seven.vercel.app/get-started",
+    "https://client0-seven.vercel.app",
     "http://localhost:5173",
     "http://127.0.0.1:5173",
+    process.env.CLIENT_URL,
+    ...(process.env.CLIENT_URLS?.split(",") ?? []),
   ]
-    .flat()
-    .filter(Boolean)
-    .map((origin) => origin.trim())
+    .map(normalizeOrigin)
+    .filter((origin) => origin !== null)
 );
 
 app.use(
   cors({
     origin: (origin, callback) => {
       if (!origin) return callback(null, true);
-      if (allowedOrigins.has(origin)) return callback(null, true);
-      if (/^http:\/\/192\.168\.\d+\.\d+:5173$/.test(origin)) return callback(null, true);
-      return callback(new Error("CORS blocked for this origin"));
+      const normalizedOrigin = normalizeOrigin(origin);
+      if (normalizedOrigin && allowedOrigins.has(normalizedOrigin)) return callback(null, true);
+
+      const error = new Error("CORS origin rejected");
+      error.code = "CORS_ORIGIN_DENIED";
+      error.origin = origin;
+      return callback(error);
     },
-    credentials: true
+    methods: ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    allowedHeaders: ["Content-Type", "Authorization"],
+    credentials: true,
+    optionsSuccessStatus: 204
   })
 );
 app.use(express.json());
@@ -48,7 +76,20 @@ app.use((req, res) => {
 });
 
 app.use((error, req, res, next) => {
-  console.error(error);
   if (res.headersSent) return next(error);
+
+  if (error.code === "CORS_ORIGIN_DENIED") {
+    console.warn("Rejected CORS origin:", JSON.stringify(error.origin).slice(0, 200));
+    return res.status(403).json({ message: "Origin is not allowed" });
+  }
+
+  if (error.type === "entity.parse.failed") {
+    return res.status(400).json({ message: "Invalid JSON request body" });
+  }
+
+  console.error("Unhandled request error", {
+    name: error.name,
+    code: typeof error.code === "string" || typeof error.code === "number" ? error.code : undefined
+  });
   res.status(500).json({ message: "Internal server error" });
 });
