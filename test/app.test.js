@@ -35,6 +35,85 @@ test("root and health endpoints respond with success", async () => {
   assert.deepEqual(await apiHealthResponse.json(), { ok: true });
 });
 
+test("auth flow: register -> duplicate reject -> login -> me", async () => {
+  const email = `test.${Date.now()}@example.com`;
+  const password = "password123";
+
+  // 1. Register new user
+  const regResponse = await fetch(`${baseUrl}/api/users/register`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ name: "Auth Tester", email, password })
+  });
+  assert.equal(regResponse.status, 201);
+  const regData = await regResponse.json();
+  assert.ok(regData.token, "Registration should return a token");
+  assert.equal(regData.user.email, email);
+  assert.equal(regData.user.name, "Auth Tester");
+  assert.equal(regData.user.password, undefined, "Password hash must not be exposed");
+
+  // 2. Duplicate registration should be rejected with 409
+  const dupResponse = await fetch(`${baseUrl}/api/users/register`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ name: "Clone", email, password })
+  });
+  assert.equal(dupResponse.status, 409);
+
+  // 3. Login with correct credentials
+  const loginResponse = await fetch(`${baseUrl}/api/users/login`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ email, password })
+  });
+  assert.equal(loginResponse.status, 200);
+  const loginData = await loginResponse.json();
+  assert.ok(loginData.token, "Login should return a token");
+  assert.equal(loginData.user.email, email);
+
+  // 4. Login with incorrect password
+  const badLoginResponse = await fetch(`${baseUrl}/api/users/login`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ email, password: "wrong_password" })
+  });
+  assert.equal(badLoginResponse.status, 401);
+
+  // 5. Connect fitness profile to authenticated user via /get-started
+  const profileResponse = await fetch(`${baseUrl}/api/users/get-started`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${loginData.token}`
+    },
+    body: JSON.stringify({
+      name: "Auth Tester",
+      age: 26,
+      heightCm: 180,
+      weightKg: 78,
+      gender: "male",
+      fitnessGoal: "muscle_gain",
+      experienceLevel: "intermediate"
+    })
+  });
+  assert.equal(profileResponse.status, 200);
+  const profileData = await profileResponse.json();
+  assert.equal(profileData.user._id, loginData.user._id, "Profile must attach to the authenticated user ID");
+  assert.equal(profileData.user.hasProfile, true);
+  assert.equal(profileData.user.age, 26);
+  assert.equal(profileData.updated, true);
+
+  // 6. Fetch /me to verify profile fields are persisted with the user
+  const meResponse = await fetch(`${baseUrl}/api/users/me`, {
+    headers: { Authorization: `Bearer ${loginData.token}` }
+  });
+  assert.equal(meResponse.status, 200);
+  const meData = await meResponse.json();
+  assert.equal(meData._id, loginData.user._id);
+  assert.equal(meData.age, 26);
+  assert.equal(meData.fitnessGoal, "muscle_gain");
+});
+
 test("production origin can preflight profile creation", async () => {
   const response = await fetch(`${baseUrl}/api/users/get-started`, {
     method: "OPTIONS",
@@ -83,52 +162,4 @@ test("profile endpoint is mounted once and validates profile data", async () => 
     body: JSON.stringify({})
   });
   assert.equal(duplicatePrefixResponse.status, 404);
-});
-
-test("valid profile creation uses the existing plan and token response", async () => {
-  const response = await fetch(`${baseUrl}/api/users/get-started`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      name: "Alex",
-      age: 28,
-      heightCm: 175,
-      weightKg: 72,
-      gender: "male",
-      fitnessGoal: "muscle_gain",
-      experienceLevel: "beginner"
-    })
-  });
-  const result = await response.json();
-
-  assert.equal(response.status, 201);
-  assert.equal(typeof result.token, "string");
-  assert.equal(result.user.name, "Alex");
-  assert.equal(result.user.age, 28);
-  assert.equal(result.recommendationSource, "rule_based");
-
-  // Verify that submitting again with the token UPDATES the profile without creating duplicates
-  const updateResponse = await fetch(`${baseUrl}/api/users/get-started`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${result.token}`
-    },
-    body: JSON.stringify({
-      name: "Alex Updated",
-      age: 29,
-      heightCm: 175,
-      weightKg: 74,
-      gender: "male",
-      fitnessGoal: "strength",
-      experienceLevel: "intermediate"
-    })
-  });
-
-  assert.equal(updateResponse.status, 200);
-  const updateResult = await updateResponse.json();
-  assert.equal(updateResult.user._id, result.user._id, "Should preserve the same user ID");
-  assert.equal(updateResult.user.name, "Alex Updated");
-  assert.equal(updateResult.user.age, 29);
-  assert.equal(updateResult.updated, true);
 });

@@ -19,6 +19,14 @@ export const memoryStore = {
   getUserById(userId) {
     return users.get(String(userId)) || null;
   },
+  getUserByEmail(email) {
+    if (!email) return null;
+    const lower = String(email).toLowerCase();
+    for (const u of users.values()) {
+      if (u.email && String(u.email).toLowerCase() === lower) return u;
+    }
+    return null;
+  },
   updateUser(userId, patch) {
     const prev = users.get(String(userId));
     if (!prev) return null;
