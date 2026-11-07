@@ -1,4 +1,5 @@
 import jwt from "jsonwebtoken";
+import mongoose from "mongoose";
 import { User } from "../models/User.js";
 import { WorkoutPlan } from "../models/WorkoutPlan.js";
 import { DietPlan } from "../models/DietPlan.js";
@@ -33,20 +34,22 @@ export const getStarted = async (req, res) => {
       equipmentPreference,
       injuriesLimitations
     } = req.body;
+
     const payload = {
-      name,
-      age,
-      heightCm,
-      weightKg,
+      name: (typeof name === "string" && name.trim()) || "Gym User",
+      age: Number(age),
+      heightCm: Number(heightCm),
+      weightKg: Number(weightKg),
       gender,
       fitnessGoal,
       experienceLevel,
-      activityLevel,
-      dietPreference,
-      workoutDaysPerWeek,
-      equipmentPreference,
-      injuriesLimitations
+      activityLevel: activityLevel || "moderate",
+      dietPreference: dietPreference || "veg",
+      workoutDaysPerWeek: workoutDaysPerWeek ? Number(workoutDaysPerWeek) : 3,
+      equipmentPreference: equipmentPreference || "gym",
+      injuriesLimitations: typeof injuriesLimitations === "string" ? injuriesLimitations : ""
     };
+
     const profile = new User(payload);
     const validationError = profile.validateSync();
     if (validationError) {
@@ -57,9 +60,42 @@ export const getStarted = async (req, res) => {
     }
 
     const { _id, createdAt, updatedAt, ...validatedPayload } = profile.toObject({ versionKey: false });
-    const user = runtimeState.dbConnected
-      ? await User.create(validatedPayload)
-      : memoryStore.createUser(validatedPayload);
+
+    // Check if user is already authenticated (update existing profile without creating duplicates)
+    let existingUserId = null;
+    const authHeader = req.headers.authorization;
+    if (authHeader && authHeader.startsWith("Bearer ")) {
+      try {
+        const decoded = jwt.verify(authHeader.split(" ")[1], jwtSecret);
+        if (decoded?.userId) {
+          existingUserId = decoded.userId;
+        }
+      } catch {
+        // Token invalid or expired, proceed to create new user profile
+      }
+    }
+
+    let user = null;
+    let isUpdate = false;
+
+    if (existingUserId) {
+      user = runtimeState.dbConnected
+        ? await User.findById(existingUserId)
+        : memoryStore.getUserById(existingUserId);
+
+      if (user) {
+        user = runtimeState.dbConnected
+          ? await User.findByIdAndUpdate(user._id, { $set: validatedPayload }, { new: true })
+          : memoryStore.updateUser(user._id, validatedPayload);
+        isUpdate = true;
+      }
+    }
+
+    if (!user) {
+      user = runtimeState.dbConnected
+        ? await User.create(validatedPayload)
+        : memoryStore.createUser(validatedPayload);
+    }
 
     const { workout, diet, source } = await generatePersonalizedPlans(user);
     const workoutPlan = {
@@ -70,30 +106,94 @@ export const getStarted = async (req, res) => {
     };
 
     if (runtimeState.dbConnected) {
-      await WorkoutPlan.create({
-        userId: user._id,
-        ...workoutPlan
-      });
+      await WorkoutPlan.findOneAndUpdate(
+        { userId: user._id },
+        { $set: { userId: user._id, ...workoutPlan } },
+        { upsert: true, new: true }
+      );
 
-      await DietPlan.create({
-        userId: user._id,
-        ...diet
-      });
+      await DietPlan.findOneAndUpdate(
+        { userId: user._id },
+        { $set: { userId: user._id, ...diet } },
+        { upsert: true, new: true }
+      );
     } else {
       memoryStore.upsertWorkout(user._id, workoutPlan);
       memoryStore.upsertDiet(user._id, diet);
     }
 
-    res.status(201).json({
+    res.status(isUpdate ? 200 : 201).json({
       token: signToken(user._id),
       user,
-      recommendationSource: source
+      recommendationSource: source,
+      updated: isUpdate
     });
   } catch (error) {
     console.error("Profile creation failed", {
       name: error.name,
-      code: typeof error.code === "string" || typeof error.code === "number" ? error.code : undefined
+      code: error.code,
+      keyPattern: error.keyPattern,
+      keyValue: error.keyValue,
+      message: error.message
     });
+
+    // Handle Mongo duplicate key error (E11000)
+    if (error.code === 11000) {
+      const field = error.keyPattern ? Object.keys(error.keyPattern)[0] : "field";
+      console.warn(`[E11000 Resolution] Duplicate key detected on field '${field}':`, error.keyValue);
+
+      // If the duplicate key is triggered by a legacy/null index on MongoDB collection
+      if (runtimeState.dbConnected && mongoose.connection.db) {
+        try {
+          const db = mongoose.connection.db;
+          const col = db.collection("users");
+          const indexes = await col.indexes();
+          const conflictingIndex = indexes.find(
+            (idx) => idx.key && idx.key[field] !== undefined && idx.unique && idx.name !== "_id_"
+          );
+
+          if (conflictingIndex) {
+            console.warn(`[E11000 Resolution] Dropping conflicting index '${conflictingIndex.name}' on 'users.${field}'`);
+            await col.dropIndex(conflictingIndex.name);
+
+            // Re-attempt creating the profile after dropping the phantom unique index
+            const retriedUser = await User.create(req.body);
+            const { workout, diet, source } = await generatePersonalizedPlans(retriedUser);
+            const workoutPlan = {
+              ...workout,
+              goal: retriedUser.fitnessGoal,
+              level: retriedUser.experienceLevel,
+              weeklySchedule: workout.weeklyPlan
+            };
+
+            await WorkoutPlan.findOneAndUpdate(
+              { userId: retriedUser._id },
+              { $set: { userId: retriedUser._id, ...workoutPlan } },
+              { upsert: true }
+            );
+            await DietPlan.findOneAndUpdate(
+              { userId: retriedUser._id },
+              { $set: { userId: retriedUser._id, ...diet } },
+              { upsert: true }
+            );
+
+            return res.status(201).json({
+              token: signToken(retriedUser._id),
+              user: retriedUser,
+              recommendationSource: source
+            });
+          }
+        } catch (repairError) {
+          console.error("[E11000 Resolution] Index drop retry failed:", repairError.message);
+        }
+      }
+
+      return res.status(409).json({
+        message: `A profile with this ${field} already exists.`,
+        conflictField: field
+      });
+    }
+
     res.status(500).json({ message: "Unable to create profile" });
   }
 };
